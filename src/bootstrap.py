@@ -4,9 +4,7 @@ from pathlib import Path
 
 def opening_path(data_dir, year:int) -> dict:
     return {
-        "inventory": data_dir/f"{year}"/f"inventory.csv",
-        "realized_pnl": data_dir/f"{year}"/f"realized_pnl.csv",
-        "dividends": data_dir/f"{year}"/f"dividends.csv"
+        "inventory": data_dir/f"{year}"/f"inventory.csv"
     }
 
 def build_opening_tables():
@@ -17,7 +15,7 @@ def build_opening_tables():
         "stock_symbol": pd.Series(dtype="string"),
         "stock_name": pd.Series(dtype="string"),
         "qty": pd.Series(dtype="int64"),
-        "cost": pd.Series(dtype="float64"),
+        "": pd.Series(dtype="float64"),
     })
    
     
@@ -55,9 +53,9 @@ def save_opening_tables(data_dir: Path, year:int,
 
 def ensure_opening_data(data_dir: Path, year:int)-> dict:
     paths = opening_path(data_dir, year)
-    missing = [k for k, path in p.items() if not path.exists()]
+    missing = [k for k, path in paths.items() if not path.exists()]
     if missing:
-        msg = ", ".join(f"{k}={p[k].name}" for k in missing)
+        msg = ", ".join(f"{k}={paths[k].name}" for k in missing)
         raise FileNotFoundError(
             f"Missing opening tables for year {year}: {msg}. "
             f"If this is the start year, run with --is-start to generate them."
