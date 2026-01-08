@@ -11,6 +11,7 @@ from src.engine_fifo import (
     apply_trades_fifo,
     save_inventories,
     save_realized_pnl,
+    load_actions,
 )
 
 
@@ -72,7 +73,9 @@ def main():
     for symbol, queue in inventories.items():
         print(f"Inventory for {symbol}: {list(queue)}\n")
 
-    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories)
+    actions_df = load_actions(data_dir, year)  
+
+    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories, actions_df, year)
     print("Updated Inventory:", inventory)
 
     print("Realized PnL DataFrame:")

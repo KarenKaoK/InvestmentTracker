@@ -47,6 +47,71 @@ def load_trades(data_dir: Path, year: int) -> pd.DataFrame:
     )
     return df
 
+def load_actions(data_dir: Path, year: int) -> pd.DataFrame:
+    path = data_dir / "actions.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Actions file not found: {path}")
+
+    df = pd.read_csv(
+        path,
+        dtype={
+            "symbol": "string",
+            "action_type": "string",
+            "ratio_from": "Int64",
+            "ratio_to": "Int64",
+        },
+        parse_dates=["action_date"],
+        skip_blank_lines=True,
+    )
+    return df
+
+def prepare_action_queue(corp_actions_df: pd.DataFrame, year: int) -> Deque[dict]:
+
+    if corp_actions_df is None or corp_actions_df.empty:
+        return deque()
+
+    df = corp_actions_df.copy()
+    df = df.dropna(subset=['action_date', 'symbol', 'action_type', 'ratio_from', 'ratio_to']).copy()
+
+    print(df)
+
+    df["symbol"] = df["symbol"].astype("string")
+    df["action_type"] = df["action_type"].astype("string")
+    df["action_date"] = pd.to_datetime(df["action_date"])
+
+    df = df[df["action_date"].dt.year == year].copy()
+    df = df.sort_values(by=["action_date"]).reset_index(drop=True)
+
+    return deque(df.to_dict("records"))
+
+def apply_corporate_action(action: dict, inventories: Dict[str, Deque[Lot]]) -> None:
+    symbol = str(action["symbol"]).strip()
+    action_type = str(action["action_type"]).strip().upper()
+    action_date = action.get("action_date")
+
+    inventories.setdefault(symbol, deque())
+    inv = inventories[symbol]
+
+    if action_type == "SPLIT":
+        rf = int(action["ratio_from"])
+        rt = int(action["ratio_to"])
+
+        if rf <= 0 or rt <= 0:
+            raise ValueError(f"Invalid SPLIT ratio: {rf} -> {rt} for {symbol} on {action_date}")
+
+        if rt % rf != 0:
+            raise ValueError(f"SPLIT ratio must be integer multiple: {rf} -> {rt} for {symbol} on {action_date}")
+
+        k = rt // rf
+
+        for lot in inv:
+            lot.qty = int(lot.qty) * k
+            lot.price = float(lot.price) / k
+
+    else:
+        raise ValueError(f"Unsupported action_type: {action_type} ({symbol} {action_date})")
+
+
 def inventory_df_to_queues(inventory_df: pd.DataFrame) -> Dict[str, Deque[Lot]]:
     
     inventories: Dict[str, Deque[Lot]] = defaultdict(deque)
@@ -67,34 +132,56 @@ def inventory_df_to_queues(inventory_df: pd.DataFrame) -> Dict[str, Deque[Lot]]:
 
     return inventories
 
-def apply_trades_fifo(trades_df:pd.DataFrame,
-                      inventories: Dict[str,Deque[Lot]],
-                      ) -> pd.DataFrame:
-    
-    # trades_df process
-    df = trades_df.copy()
-    df = df.dropna(subset=['stock_symbol','side','qty','price','transaction_date']).copy()
-    df = df.sort_values(by=["transaction_date"]).reset_index(drop=True)
+def apply_trades_fifo(
+    trades_df: pd.DataFrame,
+    inventories: Dict[str, Deque[Lot]],
+    actions_df: pd.DataFrame | None = None,
+    year: int | None = None,
+) -> tuple[Dict[str, Deque[Lot]], pd.DataFrame]:
 
-    # create realized list 
+    # ---- prepare trades queue ----
+    df = trades_df.copy()
+    df = df.dropna(subset=["stock_symbol", "side", "qty", "price", "transaction_date"]).copy()
+    df["transaction_date"] = pd.to_datetime(df["transaction_date"])
+    df["stock_symbol"] = df["stock_symbol"].astype("string").str.strip()
+    df["side"] = df["side"].astype("string").str.strip().str.upper()
+    df = df.sort_values(by=["transaction_date"]).reset_index(drop=True)
+    trade_q: Deque[dict] = deque(df.to_dict("records"))
+
+    # ---- prepare actions queue (only once) ----
+    if actions_df is not None and year is not None:
+        action_q: Deque[dict] = prepare_action_queue(actions_df, year)
+    else:
+        action_q = deque()
+
     realized_pnl_records: List[dict] = []
 
-    # one-line process each trade
-    for _, row in df.iterrows():
+    # ---- merge loop ----
+    # rule: same day -> trade first, then action
+    while trade_q or action_q:
+        td = trade_q[0]["transaction_date"] if trade_q else None
+        ad = action_q[0]["action_date"] if action_q else None
 
-        symbol = str(row.stock_symbol)
-        side = str(row.side).upper().upper()
-        qty = int(row.qty)
-        price = float(row.price)
-        date = row.transaction_date
+        # action only runs if strictly earlier than next trade date
+        # (same day trade first -> so NOT using <=)
+        if ad is not None and (td is None or ad < td):
+            act = action_q.popleft()
+            apply_corporate_action(act, inventories)
+            continue
 
-        if symbol not in inventories:
-            inventories[symbol] = deque()
+        # otherwise process a trade
+        tr = trade_q.popleft()
+        symbol = str(tr["stock_symbol"]).strip()
+        side = str(tr["side"]).upper()
+        qty = int(tr["qty"])
+        price = float(tr["price"])
+        date = tr["transaction_date"]
 
+        inventories.setdefault(symbol, deque())
         inventory = inventories[symbol]
 
         if side == "BUY":
-            inventory.append(Lot(qty=qty, price=price, date=date,))
+            inventory.append(Lot(qty=qty, price=price, date=date))
 
         elif side == "SELL":
             remaining_qty = qty
@@ -104,32 +191,34 @@ def apply_trades_fifo(trades_df:pd.DataFrame,
                     raise ValueError(f"Not enough inventory to sell for {symbol} on {date}")
 
                 lot = inventory.popleft()
-                lot_qty, lot_price, lot_date = lot.qty, lot.price, lot.date
+                lot_qty = int(lot.qty)
+                lot_price = float(lot.price)
+                lot_date = lot.date
 
-                if lot_qty <= remaining_qty:
-                    sell_qty = lot_qty
-                    realized_pnl = sell_qty * (price - lot_price)
-                    remaining_qty -= sell_qty
-                else:
-                    sell_qty = remaining_qty
-                    realized_pnl = sell_qty * (price - lot_price)
-                    inventory.appendleft((lot_qty - sell_qty, lot_price, lot_date))
-                    remaining_qty = 0
+                sell_qty = min(lot_qty, remaining_qty)
+                remaining_qty -= sell_qty
+
+                realized_pnl = round(sell_qty * (price - lot_price), 0)
+
+                remaining_lot_qty = lot_qty - sell_qty
+                if remaining_lot_qty > 0:
+                    inventory.appendleft(Lot(qty=remaining_lot_qty, price=lot_price, date=lot_date))
 
                 realized_pnl_records.append({
                     "transaction_date": date,
                     "stock_symbol": symbol,
                     "sell_qty": sell_qty,
                     "sell_price": price,
-                    "buy_date": lot.date,
-                    "buy_price": lot.price,
+                    "buy_date": lot_date,
+                    "buy_price": lot_price,
                     "realized_pnl": realized_pnl,
                 })
+
         else:
             raise ValueError(f"Unknown trade side: {side} for {symbol} on {date}")
-    
-    realized_pnl_df = pd.DataFrame(realized_pnl_records)
-    return inventories, realized_pnl_df
+
+    return inventories, pd.DataFrame(realized_pnl_records)
+
 
 def save_inventories(data_dir: Path, year:int,
                      inventories: Dict[str,Deque[Lot]]):
@@ -152,6 +241,7 @@ def save_inventories(data_dir: Path, year:int,
         columns=["transaction_date", "stock_symbol", "qty", "price"]
     )
     inv_df.to_csv(path, index=False)
+    print(f"!!! Saved updated inventory to {path}")
     return path
 
 def save_realized_pnl(
@@ -185,7 +275,8 @@ def save_realized_pnl(
 
 if __name__ == "__main__":
     data_dir = Path("data")
-    year = 2023
+    year = 2025
+
 
     print('year:', year)
 
@@ -200,7 +291,9 @@ if __name__ == "__main__":
     for symbol, queue in inventories.items():
         print(f"Inventory for {symbol}: {list(queue)}")
 
-    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories)
+    actions_df = load_actions(data_dir, year)    
+
+    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories, actions_df, year)
 
     print("Updated Inventory:", inventory)
     print("Realized PnL DataFrame:")
@@ -208,3 +301,5 @@ if __name__ == "__main__":
 
     save_inventories(data_dir, year, inventories)
     save_realized_pnl(data_dir, year, realized_pnl_df)
+
+    print('finished')
