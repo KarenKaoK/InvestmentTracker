@@ -21,7 +21,7 @@ from src.dividends import (
     save_dividend_ledger,
 )
 from src.snapshots import SnapshotCollector
-
+from src.annual_report import build_annual_report, save_annual_report   
 
 
 def main():
@@ -115,6 +115,11 @@ def main():
         dividend_ledger_df = compute_dividend_ledger(div_df_year, snapshots)
         out_path = save_dividend_ledger(data_dir / f"{year}" / "dividends.csv", dividend_ledger_df)
         print(f"!!! Saved dividends ledger to {out_path}")
+
+    
+    report = build_annual_report(data_dir, year)
+    save_annual_report(data_dir, year,report)
+
 
     print('finished')
     

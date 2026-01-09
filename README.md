@@ -6,6 +6,7 @@ source .venv/bin/activate
 
 
 pip install pandas 
+ pip3 install openpyxl
 
 
 ## how to use
