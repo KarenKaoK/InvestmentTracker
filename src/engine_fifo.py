@@ -2,8 +2,34 @@ import os
 import pandas as pd
 from pathlib import Path
 from collections import deque, defaultdict
-from typing import Dict, Deque, Tuple, List
+from typing import Dict, Deque, List, Optional, Tuple
 from dataclasses import dataclass
+
+# NOTE:
+# This file integrates the snapshot + dividends workflow.
+# - snapshots.py provides SnapshotCollector (date-driven inventory snapshots)
+# - dividends.py provides dividend history parsing and ledger computation
+
+try:
+    # If running as a package (recommended)
+    from src.snapshots import SnapshotCollector
+    from src.dividends import (
+        load_dividens,
+        prepare_dividends_for_year,
+        build_needed_snapshot_map,
+        compute_dividend_ledger,
+        save_dividend_ledger,
+    )
+except Exception:
+    # If running as plain scripts in the same folder
+    from snapshots import SnapshotCollector
+    from dividends import (
+        load_dividens,
+        prepare_dividends_for_year,
+        build_needed_snapshot_map,
+        compute_dividend_ledger,
+        save_dividend_ledger,
+    )
 
 @dataclass
 class Lot:
@@ -137,7 +163,9 @@ def apply_trades_fifo(
     inventories: Dict[str, Deque[Lot]],
     actions_df: pd.DataFrame | None = None,
     year: int | None = None,
-) -> tuple[Dict[str, Deque[Lot]], pd.DataFrame]:
+    # NEW: snapshot collector (date-driven)
+    snapshot_collector: Optional[SnapshotCollector] = None,
+) -> tuple[Dict[str, Deque[Lot]], pd.DataFrame, Optional[Dict[pd.Timestamp, Dict[str, int]]]]:
 
     # ---- prepare trades queue ----
     df = trades_df.copy()
@@ -156,9 +184,25 @@ def apply_trades_fifo(
 
     realized_pnl_records: List[dict] = []
 
+    def _peek_next_event_date() -> Optional[pd.Timestamp]:
+        """Return the next event *date* (normalized) among trade/action queues."""
+        td = trade_q[0]["transaction_date"].normalize() if trade_q else None
+        ad = action_q[0]["action_date"].normalize() if action_q else None
+        if td is None:
+            return ad
+        if ad is None:
+            return td
+        return td if td <= ad else ad
+
     # ---- merge loop ----
     # rule: same day -> trade first, then action
     while trade_q or action_q:
+        next_event_date = _peek_next_event_date()
+
+        # IMPORTANT: capture snapshots for any snapshot_date < next_event_date
+        if snapshot_collector is not None:
+            snapshot_collector.consume_until(next_event_date, inventories)
+
         td = trade_q[0]["transaction_date"] if trade_q else None
         ad = action_q[0]["action_date"] if action_q else None
 
@@ -217,7 +261,13 @@ def apply_trades_fifo(
         else:
             raise ValueError(f"Unknown trade side: {side} for {symbol} on {date}")
 
-    return inventories, pd.DataFrame(realized_pnl_records)
+    # after finishing all events, capture remaining snapshot dates
+    snapshots_out: Optional[Dict[pd.Timestamp, Dict[str, int]]] = None
+    if snapshot_collector is not None:
+        snapshot_collector.finalize(inventories)
+        snapshots_out = snapshot_collector.snapshots
+
+    return inventories, pd.DataFrame(realized_pnl_records), snapshots_out
 
 
 def save_inventories(data_dir: Path, year:int,
@@ -291,9 +341,26 @@ if __name__ == "__main__":
     for symbol, queue in inventories.items():
         print(f"Inventory for {symbol}: {list(queue)}")
 
-    actions_df = load_actions(data_dir, year)    
+    actions_df = load_actions(data_dir, year)
 
-    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories, actions_df, year)
+    # --- dividends: prepare snapshot dates for this year ---
+    try:
+        div_history_df = load_dividens(data_dir)
+        div_df_year = prepare_dividends_for_year(div_history_df, year)
+        snapshot_dates = build_needed_snapshot_map(div_df_year)  # list[pd.Timestamp]
+    except FileNotFoundError:
+        div_df_year = pd.DataFrame(columns=["symbol", "ex_dividend_date", "dividends"])
+        snapshot_dates = []
+
+    collector = SnapshotCollector(snapshot_dates)
+
+    inventory, realized_pnl_df, snapshots = apply_trades_fifo(
+        trades_df,
+        inventories,
+        actions_df,
+        year,
+        snapshot_collector=collector,
+    )
 
     print("Updated Inventory:", inventory)
     print("Realized PnL DataFrame:")
@@ -301,5 +368,11 @@ if __name__ == "__main__":
 
     save_inventories(data_dir, year, inventories)
     save_realized_pnl(data_dir, year, realized_pnl_df)
+
+    # --- dividends: compute ledger using snapshots ---
+    if snapshots is not None and div_df_year is not None and not div_df_year.empty:
+        dividend_ledger_df = compute_dividend_ledger(div_df_year, snapshots)
+        out_path = save_dividend_ledger(data_dir / f"{year}" / "dividends.csv", dividend_ledger_df)
+        print(f"!!! Saved dividends ledger to {out_path}")
 
     print('finished')

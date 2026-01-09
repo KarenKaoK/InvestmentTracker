@@ -46,9 +46,6 @@ def save_opening_tables(data_dir: Path, year:int,
                         inv_df, pnl_df, div_df):
     paths = opening_path(data_dir, year)
     inv_df.to_csv(paths["inventory"], index=False)
-    pnl_df.to_csv(paths["realized_pnl"], index=False)
-    div_df.to_csv(paths["dividends"], index=False)
-
     return paths
 
 def ensure_opening_data(data_dir: Path, year:int)-> dict:

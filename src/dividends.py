@@ -80,7 +80,7 @@ def compute_dividend_ledger(
 
         snap = snapshots.get(snap_date, {})
         eligible_qty = int(snap.get(symbol, 0))
-        amount = eligible_qty * per_share
+        amount = round(eligible_qty * per_share,0)
 
         records.append({
             "symbol": symbol,
@@ -144,7 +144,6 @@ if __name__ == "__main__":
         pd.Timestamp("2023-06-16"): {"2330": 400, "0050": 600},
         pd.Timestamp("2023-09-13"): {"2330": 500, "0050": 900},
     }
-
 
     # compute ledger
     ledger = compute_dividend_ledger(div_df_year,fake_snapshots)

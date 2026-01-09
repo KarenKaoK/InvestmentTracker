@@ -13,6 +13,15 @@ from src.engine_fifo import (
     save_realized_pnl,
     load_actions,
 )
+from src.dividends import (
+    load_dividens,
+    prepare_dividends_for_year,
+    build_needed_snapshot_map,
+    compute_dividend_ledger,
+    save_dividend_ledger,
+)
+from src.snapshots import SnapshotCollector
+
 
 
 def main():
@@ -75,15 +84,39 @@ def main():
 
     actions_df = load_actions(data_dir, year)  
 
-    inventory, realized_pnl_df = apply_trades_fifo(trades_df, inventories, actions_df, year)
-    print("Updated Inventory:", inventory)
+    # --- dividends: prepare snapshot dates for this year ---
+    try:
+        div_history_df = load_dividens(data_dir)
+        div_df_year = prepare_dividends_for_year(div_history_df, year)
+        snapshot_dates = build_needed_snapshot_map(div_df_year)  # list[pd.Timestamp]
+    except FileNotFoundError:
+        div_df_year = pd.DataFrame(columns=["symbol", "ex_dividend_date", "dividends"])
+        snapshot_dates = []
 
+    collector = SnapshotCollector(snapshot_dates)
+
+    inventory, realized_pnl_df, snapshots = apply_trades_fifo(
+        trades_df,
+        inventories,
+        actions_df,
+        year,
+        snapshot_collector=collector,
+    )
+
+    print("Updated Inventory:", inventory)
     print("Realized PnL DataFrame:")
     print(realized_pnl_df)
 
     save_inventories(data_dir, year, inventories)
     save_realized_pnl(data_dir, year, realized_pnl_df)
 
+    # --- dividends: compute ledger using snapshots ---
+    if snapshots is not None and div_df_year is not None and not div_df_year.empty:
+        dividend_ledger_df = compute_dividend_ledger(div_df_year, snapshots)
+        out_path = save_dividend_ledger(data_dir / f"{year}" / "dividends.csv", dividend_ledger_df)
+        print(f"!!! Saved dividends ledger to {out_path}")
+
+    print('finished')
     
 
     # =======================
